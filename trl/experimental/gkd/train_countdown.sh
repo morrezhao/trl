@@ -1,0 +1,1 @@
+accelerate launch --config_file /data/zhaoenhan/on-policy-distill/trl/trl/accelerate_configs/zero2.yaml train_countdown_gkd.py
