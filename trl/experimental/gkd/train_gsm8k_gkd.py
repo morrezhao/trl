@@ -72,7 +72,6 @@ def format_gsm8k_to_messages(example: dict) -> dict:
             "role": "user",
             "content": USER_PROMPT_TEMPLATE.format(question=example["question"]),
         },
-        {"role": "assistant", "content": ""},
     ]
     return {"messages": messages, "answer": example["answer"], "question": example["question"]}
 
@@ -214,9 +213,9 @@ class PassRateEvaluationCallback(TrainerCallback):
                 )
 
                 # Decode and verify each response in the batch
+                # Use full input length (including padding) since output includes padding tokens
+                prompt_length = inputs["input_ids"].shape[1]
                 for i, (output, answer) in enumerate(zip(outputs, batch_answers)):
-                    # Get the prompt length for this sample (accounting for padding)
-                    prompt_length = inputs["attention_mask"][i].sum().item()
                     response = self.tokenizer.decode(
                         output[prompt_length:],
                         skip_special_tokens=True,
@@ -398,7 +397,7 @@ def main():
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    # Train
+    # Train    
     main_print("\nStarting training...")
     trainer.train()
 
