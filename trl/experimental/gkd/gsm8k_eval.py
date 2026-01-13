@@ -13,7 +13,7 @@ def extract_answer_from_response(response: str) -> Optional[str]:
     - boxed{XXX}
     """
     # Try <answer>...</answer> format first
-    answer_match = re.search(r"<answer>\s*(.*?)\s*</answer>", response, re.IGNORECASE | re.DOTALL)
+    answer_match = re.search(r"<answer>(.*?)</answer>", response, re.IGNORECASE | re.DOTALL)
     if answer_match:
         return answer_match.group(1).strip()
 
@@ -125,3 +125,13 @@ def verify_gsm8k_response(response: str, ground_truth: str) -> bool:
 
     # For floats, use relative tolerance
     return abs(pred_value - gt_value) < 1e-6 * max(abs(gt_value), 1)
+
+if __name__ == "__main__":
+    # Example usage
+    response = """
+    <answer> 56 </answer>
+    """
+    ground_truth = "#### 56"
+
+    is_correct = verify_gsm8k_response(response, ground_truth)
+    print(f"Is response correct? {is_correct}")
