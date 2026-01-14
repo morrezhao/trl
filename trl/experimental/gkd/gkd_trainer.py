@@ -165,31 +165,38 @@ class GKDTrainer(SFTTrainer):
             formatting_func=formatting_func,
         )
 
-        if args.teacher_model_init_kwargs is None:
-            teacher_model_init_kwargs = {}
-        elif not isinstance(teacher_model, str):
-            raise ValueError(
-                "You passed teacher_model_init_kwargs to the GKDConfig, but your teacher_model is already instantiated."
-            )
-        else:
-            teacher_model_init_kwargs = args.teacher_model_init_kwargs
-            teacher_model_init_kwargs["dtype"] = (
-                teacher_model_init_kwargs["dtype"]
-                if teacher_model_init_kwargs["dtype"] in ["auto", None]
-                else getattr(torch, teacher_model_init_kwargs["dtype"])
-            )
+        # Self-distillation mode: student and teacher share the same model
+        self.self_distillation = args.self_distillation
 
-        if isinstance(teacher_model, str):
-            teacher_model = AutoModelForCausalLM.from_pretrained(teacher_model, **teacher_model_init_kwargs)
+        if self.self_distillation:
+            # In self-distillation mode, the teacher is the same as the student model
+            self.teacher_model = None
+        else:
+            if args.teacher_model_init_kwargs is None:
+                teacher_model_init_kwargs = {}
+            elif not isinstance(teacher_model, str):
+                raise ValueError(
+                    "You passed teacher_model_init_kwargs to the GKDConfig, but your teacher_model is already instantiated."
+                )
+            else:
+                teacher_model_init_kwargs = args.teacher_model_init_kwargs
+                teacher_model_init_kwargs["dtype"] = (
+                    teacher_model_init_kwargs["dtype"]
+                    if teacher_model_init_kwargs["dtype"] in ["auto", None]
+                    else getattr(torch, teacher_model_init_kwargs["dtype"])
+                )
+
+            if isinstance(teacher_model, str):
+                teacher_model = AutoModelForCausalLM.from_pretrained(teacher_model, **teacher_model_init_kwargs)
+
+            if self.is_deepspeed_enabled:
+                self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
+            else:
+                self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
 
         # Disable dropout in the model
         if args.disable_dropout:
             disable_dropout_in_model(self.model)
-
-        if self.is_deepspeed_enabled:
-            self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
-        else:
-            self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
 
         self.lmbda = args.lmbda
         self.beta = args.beta
@@ -286,6 +293,12 @@ class GKDTrainer(SFTTrainer):
             return jsd
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if self.self_distillation:
+            # Self-distillation mode: student and teacher share the same model
+            # Student: forward on (prompt + generated response)
+            # Teacher: forward on (prompt + answer + generated response)
+            return self._compute_self_distillation_loss(model, inputs, return_outputs)
+
         if self.use_liger_gkd_loss:
             # Forward only through the base models (avoid lm_head to save memory)
             unwrapped_student = self.accelerator.unwrap_model(model)
@@ -386,6 +399,75 @@ class GKDTrainer(SFTTrainer):
         # Return loss
         return (loss, student_outputs) if return_outputs else loss
 
+    def _compute_self_distillation_loss(self, model, inputs, return_outputs=False):
+        """
+        Compute the self-distillation loss where the student and teacher share the same model.
+
+        In this mode:
+        - Student logits: forward pass on (prompt + generated response)
+        - Teacher logits: forward pass on (prompt + ground-truth answer + generated response)
+
+        The distillation loss is computed only on the generated response tokens.
+        """
+        # Extract the prompt length
+        prompt_lengths = inputs["prompts"].shape[1]
+
+        # Student input: prompt + generated response (this is inputs["input_ids"])
+        student_input_ids = inputs["input_ids"]
+        student_attention_mask = inputs["attention_mask"]
+
+        # Get the generated response part (after prompt)
+        generated_response = student_input_ids[:, prompt_lengths:]
+        generated_response_mask = student_attention_mask[:, prompt_lengths:]
+
+        # Original input contains: prompt + ground-truth answer
+        original_input_ids = inputs["original_input_ids"]
+        original_attention_mask = inputs["original_attention_mask"]
+
+        # Teacher input: prompt + ground-truth answer + generated response
+        teacher_input_ids = torch.cat([original_input_ids, generated_response], dim=1)
+        teacher_attention_mask = torch.cat([original_attention_mask, generated_response_mask], dim=1)
+
+        # Compute student output
+        student_outputs = model(
+            input_ids=student_input_ids,
+            attention_mask=student_attention_mask,
+        )
+
+        # Compute teacher output (same model, but with different input)
+        # Use no_grad since we only need the teacher logits for computing the target distribution
+        with torch.no_grad():
+            teacher_outputs = model(
+                input_ids=teacher_input_ids,
+                attention_mask=teacher_attention_mask,
+            )
+
+        # Extract logits for the generated response tokens
+        # Student: logits for generated response start at position (prompt_lengths - 1) and go to (-1)
+        # because we predict the next token
+        shifted_student_logits = student_outputs.logits[:, prompt_lengths - 1 : -1, :]
+
+        # Teacher: the generated response starts at position original_input_ids.shape[1]
+        # So the logits for predicting generated response tokens start at position (original_input_ids.shape[1] - 1)
+        teacher_response_start = original_input_ids.shape[1] - 1
+        shifted_teacher_logits = teacher_outputs.logits[:, teacher_response_start : -1, :]
+
+        # Labels for the generated response tokens
+        shifted_labels = inputs["labels"][:, prompt_lengths:]
+
+        # Compute the generalized JSD loss
+        loss = self.generalized_jsd_loss(
+            student_logits=shifted_student_logits,
+            teacher_logits=shifted_teacher_logits,
+            labels=shifted_labels,
+            beta=self.beta,
+        )
+
+        # Empty cache
+        empty_cache()
+
+        return (loss, student_outputs) if return_outputs else loss
+
     @staticmethod
     def generate_on_policy_outputs(model, inputs, generation_config, pad_token_id=None):
         # Generate output with respect to the prompt-only
@@ -418,7 +500,15 @@ class GKDTrainer(SFTTrainer):
         This method implements the on-policy learning approach described in the GKD paper. With probability
         `self.lmbda`, it generates new responses using the student model, which are then used for training instead of
         the original inputs.
+
+        In self-distillation mode, the ground-truth answer is preserved and concatenated with the generated response
+        to form the teacher input.
         """
+        # For self-distillation, save the original input (prompt + ground-truth answer) before on-policy generation
+        if self.self_distillation:
+            original_input_ids = inputs["input_ids"].clone()
+            original_attention_mask = inputs["attention_mask"].clone()
+
         if self.seq_kd:
             with unwrap_model_for_generation(self.teacher_model, self.accelerator) as unwrapped_model:
                 new_input_ids, new_attention_mask, new_labels = self.generate_on_policy_outputs(
@@ -435,6 +525,11 @@ class GKDTrainer(SFTTrainer):
             inputs["input_ids"] = new_input_ids
             inputs["attention_mask"] = new_attention_mask
             inputs["labels"] = new_labels
+
+        # For self-distillation, pass the original input containing the ground-truth answer
+        if self.self_distillation:
+            inputs["original_input_ids"] = original_input_ids
+            inputs["original_attention_mask"] = original_attention_mask
 
         loss = super().training_step(model, inputs, num_items_in_batch)
         return loss

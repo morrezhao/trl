@@ -102,6 +102,14 @@ class GKDConfig(SFTConfig):
             "FT on teacher-generated output)."
         },
     )
+    self_distillation: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to use self-distillation mode. In this mode, the student and teacher share the same model. "
+            "The teacher receives the prompt + ground-truth answer + generated response to produce teacher logits, "
+            "while the student logits come from the forward pass on the generated response only."
+        },
+    )
 
     def __post_init__(self):
         super().__post_init__()
