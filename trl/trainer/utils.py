@@ -81,12 +81,15 @@ logger = logging.get_logger(__name__)
 class DataCollatorForChatML:
     """
     Data collator for ChatML format datasets.
+
+    The prompt is always derived from messages[:-1] (all messages except the last one)
+    to ensure alignment between prompts and input_ids. This prevents issues when
+    the dataset has separate "prompt" and "messages" fields from different sources.
     """
 
     tokenizer: PreTrainedTokenizerBase
     ignore_index: int = -100
     max_length: int = None
-    prompt_key: str = "prompt"
     messages_key: str = "messages"
 
     def __post_init__(self):
@@ -104,12 +107,13 @@ class DataCollatorForChatML:
         labels = []
 
         for example in examples:
-            formatted_prompt = example.get(self.prompt_key, None)
-            if formatted_prompt is None:
-                prompt = example[self.messages_key][:-1]
-                formatted_prompt = self.tokenizer.apply_chat_template(
-                    prompt, tokenize=False, add_generation_prompt=True
-                )
+            # Always derive prompt from messages to ensure alignment with input_ids
+            # Using a separate "prompt" field can cause misalignment if the dataset
+            # has prompt and messages from different sources
+            prompt = example[self.messages_key][:-1]
+            formatted_prompt = self.tokenizer.apply_chat_template(
+                prompt, tokenize=False, add_generation_prompt=True
+            )
 
             if "input_ids" not in example:
                 message = example[self.messages_key]
