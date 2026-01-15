@@ -83,6 +83,74 @@ def format_gsm8k_to_messages(example: dict) -> dict:
     return {"messages": messages, "answer": example["answer"], "question": example["question"]}
 
 
+class SimpleGKDCollator:
+    """
+    Simple data collator for self-distillation GKD.
+
+    Like eval time, extracts:
+    - prompt from messages[:2] (System + User) with generation prompt
+    - answer from the "answer" field directly
+
+    No packing, just simple padding.
+    """
+
+    def __init__(self, tokenizer, max_length=1024):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.ignore_index = -100
+
+    def __call__(self, examples):
+        prompts_input_ids = []
+        prompt_attention_mask = []
+        answers = []
+
+        for sample in examples:
+            # Like eval time: messages[:2] = System + User
+            messages = sample["messages"][:2]
+            prompt = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+
+            # Tokenize prompt
+            tokenized_prompt = self.tokenizer(
+                prompt,
+                truncation=True,
+                max_length=self.max_length,
+                padding=False,
+                return_tensors=None,
+                add_special_tokens=False,
+            )
+
+            prompts_input_ids.append(tokenized_prompt["input_ids"])
+            prompt_attention_mask.append([1] * len(tokenized_prompt["input_ids"]))
+            answers.append(sample["answer"])
+
+        # Pad prompts (left padding for generation)
+        prompts_input_ids = [torch.tensor(ids, dtype=torch.long) for ids in prompts_input_ids]
+        prompt_attention_mask = [torch.tensor(mask, dtype=torch.long) for mask in prompt_attention_mask]
+
+        # Left padding
+        max_len = max(len(ids) for ids in prompts_input_ids)
+        padded_prompts = torch.full((len(prompts_input_ids), max_len), self.tokenizer.pad_token_id, dtype=torch.long)
+        padded_attention = torch.zeros((len(prompts_input_ids), max_len), dtype=torch.long)
+
+        for i, (ids, mask) in enumerate(zip(prompts_input_ids, prompt_attention_mask)):
+            pad_len = max_len - len(ids)
+            padded_prompts[i, pad_len:] = ids
+            padded_attention[i, pad_len:] = mask
+
+        return {
+            "prompts": padded_prompts,
+            "prompt_attention_mask": padded_attention,
+            "answers": answers,  # List of answer strings
+            # For compatibility with GKDTrainer, provide placeholder input_ids/attention_mask/labels
+            # These will be replaced after on-policy generation
+            "input_ids": padded_prompts.clone(),
+            "attention_mask": padded_attention.clone(),
+            "labels": torch.full_like(padded_prompts, self.ignore_index),
+        }
+
+
 class PassRateEvaluationCallback(TrainerCallback):
     """
     Callback to evaluate Pass Rate during training.
@@ -341,8 +409,8 @@ def main():
         train_dataset = formatted_train.shuffle(seed=42)
         eval_dataset = formatted_test.shuffle(seed=43).select(range(min(100, len(formatted_test))))
 
-        # Remove metadata columns that aren't needed for training
-        train_dataset_for_trainer = train_dataset.remove_columns(["answer", "question"])
+        # Keep answer field for self-distillation (like eval time)
+        train_dataset_for_trainer = train_dataset.remove_columns(["question"])
 
         # Save to disk for other processes to load
         train_dataset_for_trainer.save_to_disk("/data/zhaoenhan/on-policy-distill/trl/trl/experimental/gkd/tmp/self_gkd_gsm8k_train_dataset")
@@ -371,11 +439,15 @@ def main():
     )
 
     # Initialize trainer - no teacher_model needed for self-distillation
+    # Use SimpleGKDCollator: like eval time, prompt from messages[:2], answer from "answer" field
+    data_collator = SimpleGKDCollator(tokenizer=tokenizer, max_length=training_args.max_length)
+
     main_print("Initializing Self-Distillation GKD Trainer...")
     trainer = GKDTrainer(
         model=model_name,
         teacher_model=None,  # No separate teacher model in self-distillation mode
         args=training_args,
+        data_collator=data_collator,  # Use simple collator, no packing
         train_dataset=train_dataset_for_trainer,
         eval_dataset=None,
         processing_class=tokenizer,

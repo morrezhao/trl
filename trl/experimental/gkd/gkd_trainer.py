@@ -756,6 +756,69 @@ class GKDTrainer(SFTTrainer):
 
         return generated_tokens, new_attention_mask, new_labels
 
+    def _build_original_from_answers(self, inputs):
+        """
+        Build original_input_ids (prompt + ground-truth answer) from the "answers" field.
+
+        This is like eval time: prompt from messages[:2], answer from sample["answer"].
+        Returns left-padded tensors for: input_ids, attention_mask, labels.
+        """
+        prompts = inputs["prompts"]  # [batch_size, prompt_len] - left padded
+        prompt_attention_mask = inputs["prompt_attention_mask"]
+        answers = inputs["answers"]  # List of answer strings
+        device = prompts.device
+        batch_size = prompts.shape[0]
+
+        # Tokenize each answer and build (prompt + answer) sequences
+        all_input_ids = []
+        all_attention_mask = []
+        all_labels = []
+
+        for i in range(batch_size):
+            # Get prompt tokens (remove left padding)
+            prompt_attn = prompt_attention_mask[i]
+            prompt_valid_start = (prompt_attn == 0).sum().item()
+            prompt_ids = prompts[i, prompt_valid_start:]  # valid prompt tokens
+
+            # Tokenize answer
+            answer_tokens = self.processing_class(
+                answers[i],
+                truncation=True,
+                max_length=self.args.max_new_tokens,
+                padding=False,
+                return_tensors=None,
+                add_special_tokens=False,
+            )["input_ids"]
+            answer_ids = torch.tensor(answer_tokens, dtype=torch.long, device=device)
+
+            # Concatenate: prompt + answer
+            input_ids = torch.cat([prompt_ids, answer_ids], dim=0)
+            attention_mask = torch.ones_like(input_ids)
+
+            # Labels: -100 for prompt, actual tokens for answer
+            labels = torch.full_like(input_ids, -100)
+            labels[len(prompt_ids):] = answer_ids
+
+            all_input_ids.append(input_ids)
+            all_attention_mask.append(attention_mask)
+            all_labels.append(labels)
+
+        # Left-pad to same length
+        max_len = max(ids.shape[0] for ids in all_input_ids)
+        pad_token_id = self.processing_class.pad_token_id
+
+        padded_input_ids = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long, device=device)
+        padded_attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
+        padded_labels = torch.full((batch_size, max_len), -100, dtype=torch.long, device=device)
+
+        for i, (ids, attn, lbl) in enumerate(zip(all_input_ids, all_attention_mask, all_labels)):
+            pad_len = max_len - ids.shape[0]
+            padded_input_ids[i, pad_len:] = ids
+            padded_attention_mask[i, pad_len:] = attn
+            padded_labels[i, pad_len:] = lbl
+
+        return padded_input_ids, padded_attention_mask, padded_labels
+
     def training_step(
         self, model: nn.Module, inputs: dict[str, torch.Tensor | Any], num_items_in_batch: int | None = None
     ) -> torch.Tensor:
@@ -773,13 +836,17 @@ class GKDTrainer(SFTTrainer):
 
         This implements: min KL( P(y|x) || P(y|x, y*) )
         """
-        # For self-distillation: save the DATASET's (prompt + ground-truth answer) BEFORE generation
-        # This is CRITICAL: original_input_ids contains y* from the dataset, not any model prediction
-        # inputs["input_ids"] at this point = DataCollatorForChatML output = prompt + dataset_ground_truth
+        # For self-distillation: build (prompt + ground-truth answer) from "answers" field if available
+        # This is like eval time: prompt from messages[:2], answer from sample["answer"]
         if self.self_distillation:
-            original_input_ids = inputs["input_ids"].clone()  # prompt + y* (from dataset)
-            original_attention_mask = inputs["attention_mask"].clone()
-            original_labels = inputs["labels"].clone()  # -100 for prompt, actual tokens for y*
+            if "answers" in inputs:
+                # Build original_input_ids from prompts + tokenized answers (like eval time)
+                original_input_ids, original_attention_mask, original_labels = self._build_original_from_answers(inputs)
+            else:
+                # Fallback: use DataCollatorForChatML output
+                original_input_ids = inputs["input_ids"].clone()  # prompt + y* (from dataset)
+                original_attention_mask = inputs["attention_mask"].clone()
+                original_labels = inputs["labels"].clone()  # -100 for prompt, actual tokens for y*
 
         # seq_kd: generate from teacher model (NOT compatible with self_distillation where teacher_model=None)
         if self.seq_kd:
