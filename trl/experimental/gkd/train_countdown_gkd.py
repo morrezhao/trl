@@ -367,8 +367,8 @@ def main():
         train_dataset_for_trainer = train_dataset.remove_columns(["target", "nums"])
 
         # Save to disk for other processes to load
-        train_dataset_for_trainer.save_to_disk("/data/zhaoenhan/on-policy-distill/trl/trl/experimental/gkd/tmp/gkd_train_dataset")
-        eval_dataset.save_to_disk("/data/zhaoenhan/on-policy-distill/trl/trl/experimental/gkd/tmp/gkd_eval_dataset")
+        train_dataset_for_trainer.save_to_disk("./tmp/gkd_train_dataset")
+        eval_dataset.save_to_disk("./tmp/gkd_eval_dataset")
 
     # Synchronize all processes
     if torch.distributed.is_initialized():
@@ -377,8 +377,8 @@ def main():
     # Non-main processes load from disk
     if not is_main_process():
         from datasets import load_from_disk
-        train_dataset_for_trainer = load_from_disk("/data/zhaoenhan/on-policy-distill/trl/trl/experimental/gkd/tmp/gkd_train_dataset")
-        eval_dataset = load_from_disk("/data/zhaoenhan/on-policy-distill/trl/trl/experimental/gkd/tmp/gkd_eval_dataset")
+        train_dataset_for_trainer = load_from_disk("./tmp/gkd_train_dataset")
+        eval_dataset = load_from_disk("./tmp/gkd_eval_dataset")
 
     main_print(f"Train dataset size: {len(train_dataset_for_trainer)}")
     main_print(f"Eval dataset size: {len(eval_dataset)}")

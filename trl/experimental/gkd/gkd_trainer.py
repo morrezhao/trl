@@ -448,8 +448,8 @@ class GKDTrainer(SFTTrainer):
             student_ids = student_input_ids[i]
             student_attn = student_attention_mask[i]
             # Remove left-padding for cleaner display
-            student_valid_start = (student_attn == 0).sum().item()
-            student_valid_ids = student_ids[student_valid_start:]
+            student_idx = student_attn.nonzero().squeeze(-1)
+            student_valid_ids = student_ids[student_idx[0] : student_idx[-1] + 1]
             student_decoded = tokenizer.decode(student_valid_ids, skip_special_tokens=False)
 
             print(f"\n[1] STUDENT INPUT (x + y) - prompt + generated response:")
@@ -467,15 +467,6 @@ class GKDTrainer(SFTTrainer):
             print(f"    Length: {len(orig_valid_ids)} tokens")
             print(f"    Decoded:\n    {repr(orig_decoded)}")
 
-            # 2b. Show y* tokens specifically (dataset ground-truth answer)
-            if original_labels is not None:
-                orig_labels_i = original_labels[i]
-                y_star_mask = orig_labels_i != -100
-                y_star_tokens = orig_ids[y_star_mask]
-                y_star_decoded = tokenizer.decode(y_star_tokens, skip_special_tokens=False)
-                print(f"\n[2b] y* TOKENS (dataset ground-truth answer only):")
-                print(f"    Count: {y_star_mask.sum().item()} tokens")
-                print(f"    Decoded:\n    {repr(y_star_decoded)}")
 
             # 3. Decode teacher input (x + y* + y): original + generated response
             teacher_ids = teacher_input_ids[i]
@@ -530,6 +521,8 @@ class GKDTrainer(SFTTrainer):
                     print("    [WARNING] y == y* but on_policy_generated=True - generation might have reproduced ground-truth")
                 elif not y_equals_y_star and not on_policy_generated:
                     print("    [ERROR] y != y* but on_policy_generated=False - this should not happen!")
+
+            import pdb; pdb.set_trace()
 
         print("\n" + "=" * 80 + "\n")
 
@@ -850,13 +843,12 @@ class GKDTrainer(SFTTrainer):
             )["input_ids"]
             answer_ids = torch.tensor(answer_tokens, dtype=torch.long, device=device)
 
-            # Concatenate: teacher_prompt + final_answer
-            input_ids = torch.cat([teacher_prompt_ids, answer_ids], dim=0)
+            # Concatenate: teacher_prompt
+            input_ids = teacher_prompt_ids
             attention_mask = torch.ones_like(input_ids)
 
             # Labels: -100 for prompt, actual tokens for answer
             labels = torch.full_like(input_ids, -100)
-            labels[len(teacher_prompt_ids):] = answer_ids
 
             all_input_ids.append(input_ids)
             all_attention_mask.append(attention_mask)
