@@ -460,15 +460,15 @@ def main():
     main_print("trainable/total:", trainable, "/", total)
 
     # Initial evaluation before training (only on main process to avoid distributed deadlock)
-    if is_main_process():
-        print("\nInitial Pass Rate evaluation...")
-        initial_pass_rate = pass_rate_callback._evaluate_pass_rate(trainer.model, step=0)
-        print(f"Initial Pass Rate: {initial_pass_rate:.2%}")
-        pass_rate_callback.pass_rates.append((0, initial_pass_rate))
+    # if is_main_process():
+    #     print("\nInitial Pass Rate evaluation...")
+    #     initial_pass_rate = pass_rate_callback._evaluate_pass_rate(trainer.model, step=0)
+    #     print(f"Initial Pass Rate: {initial_pass_rate:.2%}")
+    #     pass_rate_callback.pass_rates.append((0, initial_pass_rate))
 
-    # Synchronize all processes before training
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+    # # Synchronize all processes before training
+    # if torch.distributed.is_initialized():
+    #     torch.distributed.barrier()
 
     # Train
     main_print("\nStarting self-distillation training...")

@@ -305,6 +305,7 @@ def main():
         disable_dropout=True,
         report_to=["tensorboard"],
         run_name="qwen-1.5b-gsm8k-gkd",
+        debug_alignment=True,
     )
 
     # Load tokenizer

@@ -49,6 +49,13 @@ if is_liger_kernel_available():
     from liger_kernel.chunked_loss import LigerFusedLinearJSDLoss
 
 
+def extract_final_answer(answer_text: str) -> str:
+    """Extract the final numerical answer from GSM8K format (after ####)."""
+    if "####" in answer_text:
+        return answer_text.split("####")[-1].strip()
+    return answer_text.strip()
+
+
 class GKDTrainer(SFTTrainer):
     """Trainer for Generalized Knowledge Distillation (GKD) of language models.
 
@@ -758,31 +765,83 @@ class GKDTrainer(SFTTrainer):
 
     def _build_original_from_answers(self, inputs):
         """
-        Build original_input_ids (prompt + ground-truth answer) from the "answers" field.
+        Build teacher input with different system prompt that reveals the answer.
 
-        This is like eval time: prompt from messages[:2], answer from sample["answer"].
-        Returns left-padded tensors for: input_ids, attention_mask, labels.
+        For teacher (conditional distribution):
+        - System prompt: tells teacher it will evaluate student's reasoning process
+        - User prompt: Q + "The answer to the above question is [extracted answer]"
+        - y* = just the final answer number (after ####)
+
+        Returns left-padded tensors for: input_ids, attention_mask, labels, and final_answers list.
         """
-        prompts = inputs["prompts"]  # [batch_size, prompt_len] - left padded
-        prompt_attention_mask = inputs["prompt_attention_mask"]
-        answers = inputs["answers"]  # List of answer strings
-        device = prompts.device
-        batch_size = prompts.shape[0]
+        answers = inputs["answers"]  # List of answer strings (full GSM8K format)
+        device = inputs["prompts"].device
+        batch_size = inputs["prompts"].shape[0]
 
-        # Tokenize each answer and build (prompt + answer) sequences
+        # Extract final answers (just the number after ####)
+        final_answers = [extract_final_answer(ans) for ans in answers]
+
+        # Tokenize each teacher prompt + answer
         all_input_ids = []
         all_attention_mask = []
         all_labels = []
 
         for i in range(batch_size):
-            # Get prompt tokens (remove left padding)
-            prompt_attn = prompt_attention_mask[i]
-            prompt_valid_start = (prompt_attn == 0).sum().item()
-            prompt_ids = prompts[i, prompt_valid_start:]  # valid prompt tokens
+            final_ans = final_answers[i]
 
-            # Tokenize answer
+            # Build teacher system prompt - explains teacher's role
+            teacher_system_prompt = (
+                "You are a helpful assistant that evaluates mathematical reasoning. "
+                "You will be given a math problem along with its correct answer, "
+                "and you need to evaluate the student's reasoning process."
+            )
+
+            # Get user message from original prompt by decoding
+            # We need to extract the user's question from the student prompt
+            prompt_attn = inputs["prompt_attention_mask"][i]
+            prompt_valid_start = (prompt_attn == 0).sum().item()
+            prompt_ids = inputs["prompts"][i, prompt_valid_start:]
+            prompt_text = self.processing_class.decode(prompt_ids, skip_special_tokens=False)
+
+            # Extract user content from the decoded prompt
+            # The prompt follows chat template: <|im_start|>system\n...<|im_end|>\n<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n
+            user_content = ""
+            if "<|im_start|>user" in prompt_text:
+                user_part = prompt_text.split("<|im_start|>user")[-1]
+                if "<|im_end|>" in user_part:
+                    user_content = user_part.split("<|im_end|>")[0].strip()
+
+            # Build teacher user prompt: Q + answer hint
+            teacher_user_content = (
+                f"{user_content}\n\n"
+                f"The answer to the above question is {final_ans}."
+            )
+
+            # Build teacher messages with modified prompts
+            teacher_messages = [
+                {"role": "system", "content": teacher_system_prompt},
+                {"role": "user", "content": teacher_user_content},
+            ]
+
+            # Apply chat template to get teacher prompt
+            teacher_prompt = self.processing_class.apply_chat_template(
+                teacher_messages, tokenize=False, add_generation_prompt=True
+            )
+
+            # Tokenize teacher prompt
+            teacher_prompt_tokens = self.processing_class(
+                teacher_prompt,
+                truncation=True,
+                max_length=self.args.max_length,
+                padding=False,
+                return_tensors=None,
+                add_special_tokens=False,
+            )["input_ids"]
+            teacher_prompt_ids = torch.tensor(teacher_prompt_tokens, dtype=torch.long, device=device)
+
+            # Tokenize the final answer only (y* = just the number)
             answer_tokens = self.processing_class(
-                answers[i],
+                final_ans,
                 truncation=True,
                 max_length=self.args.max_new_tokens,
                 padding=False,
@@ -791,13 +850,13 @@ class GKDTrainer(SFTTrainer):
             )["input_ids"]
             answer_ids = torch.tensor(answer_tokens, dtype=torch.long, device=device)
 
-            # Concatenate: prompt + answer
-            input_ids = torch.cat([prompt_ids, answer_ids], dim=0)
+            # Concatenate: teacher_prompt + final_answer
+            input_ids = torch.cat([teacher_prompt_ids, answer_ids], dim=0)
             attention_mask = torch.ones_like(input_ids)
 
             # Labels: -100 for prompt, actual tokens for answer
             labels = torch.full_like(input_ids, -100)
-            labels[len(prompt_ids):] = answer_ids
+            labels[len(teacher_prompt_ids):] = answer_ids
 
             all_input_ids.append(input_ids)
             all_attention_mask.append(attention_mask)
@@ -817,7 +876,7 @@ class GKDTrainer(SFTTrainer):
             padded_attention_mask[i, pad_len:] = attn
             padded_labels[i, pad_len:] = lbl
 
-        return padded_input_ids, padded_attention_mask, padded_labels
+        return padded_input_ids, padded_attention_mask, padded_labels, final_answers
 
     def training_step(
         self, model: nn.Module, inputs: dict[str, torch.Tensor | Any], num_items_in_batch: int | None = None
@@ -836,12 +895,12 @@ class GKDTrainer(SFTTrainer):
 
         This implements: min KL( P(y|x) || P(y|x, y*) )
         """
-        # For self-distillation: build (prompt + ground-truth answer) from "answers" field if available
-        # This is like eval time: prompt from messages[:2], answer from sample["answer"]
+        # For self-distillation: build teacher input with different system prompt
+        # Teacher prompt includes the answer in the user message
         if self.self_distillation:
             if "answers" in inputs:
-                # Build original_input_ids from prompts + tokenized answers (like eval time)
-                original_input_ids, original_attention_mask, original_labels = self._build_original_from_answers(inputs)
+                # Build teacher input with hint about the answer
+                original_input_ids, original_attention_mask, original_labels, _ = self._build_original_from_answers(inputs)
             else:
                 # Fallback: use DataCollatorForChatML output
                 original_input_ids = inputs["input_ids"].clone()  # prompt + y* (from dataset)
