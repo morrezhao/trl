@@ -202,6 +202,8 @@ class GKDTrainer(SFTTrainer):
         self.beta = args.beta
         self.temperature = args.temperature
         self.seq_kd = args.seq_kd
+        self.debug_alignment = args.debug_alignment
+        self._debug_step_count = 0  # Counter for debug prints
 
         self.generation_config = GenerationConfig(
             max_new_tokens=args.max_new_tokens,
@@ -379,18 +381,20 @@ class GKDTrainer(SFTTrainer):
                     attention_mask=inputs["attention_mask"],
                 )
 
-            # slice the logits for the generated tokens using the inputs["prompts"] lengths
-            prompt_lengths = inputs["prompts"].shape[1]
-            shifted_student_logits = student_outputs.logits[:, prompt_lengths - 1 : -1, :]
-            shifted_teacher_logits = teacher_outputs.logits[:, prompt_lengths - 1 : -1, :]
-            shifted_labels = inputs["labels"][:, prompt_lengths:]
+            # Use labels-based slicing instead of prompts.shape[1]
+            # For next-token prediction: logits[:-1] predict labels[1:]
+            # Response tokens are where labels != -100
+            shifted_student_logits = student_outputs.logits[:, :-1, :]
+            shifted_teacher_logits = teacher_outputs.logits[:, :-1, :]
+            shifted_labels = inputs["labels"][:, 1:]  # Shifted labels for next-token prediction
 
-            # compute loss
+            # compute loss (labels mask is applied inside generalized_jsd_loss)
             loss = self.generalized_jsd_loss(
                 student_logits=shifted_student_logits,
                 teacher_logits=shifted_teacher_logits,
                 labels=shifted_labels,
                 beta=self.beta,
+                temperature=self.temperature,
             )
 
         # empty cache
@@ -399,34 +403,237 @@ class GKDTrainer(SFTTrainer):
         # Return loss
         return (loss, student_outputs) if return_outputs else loss
 
+    def _print_alignment_debug(
+        self,
+        student_input_ids,
+        student_attention_mask,
+        teacher_input_ids,
+        teacher_attention_mask,
+        teacher_response_starts,
+        original_input_ids,
+        original_attention_mask,
+        original_labels,
+        response_masks,
+        batch_size,
+        on_policy_generated=False,
+    ):
+        """Print human-readable debug information to verify token alignment for loss computation."""
+        tokenizer = self.processing_class
+
+        print("\n" + "=" * 80)
+        print(f"[DEBUG] Self-Distillation Alignment Check - Step {self._debug_step_count}")
+        print("=" * 80)
+
+        # Show whether on-policy generation happened
+        if on_policy_generated:
+            print("[INFO] ON-POLICY GENERATION: YES - y is model-generated")
+        else:
+            print("[INFO] ON-POLICY GENERATION: NO - y = y* (dataset answer used as response)")
+            print("[WARNING] When y = y*, teacher sees (x + y* + y*) and student sees (x + y*)")
+        print(f"[INFO] Temperature: {self.temperature}, Beta: {self.beta}")
+
+        for i in range(min(batch_size, 2)):  # Print first 2 samples max
+            print(f"\n{'─' * 40}")
+            print(f"Sample {i + 1}/{batch_size}")
+            print(f"{'─' * 40}")
+
+            # 1. Decode student input (x + y): prompt + generated response
+            student_ids = student_input_ids[i]
+            student_attn = student_attention_mask[i]
+            # Remove left-padding for cleaner display
+            student_valid_start = (student_attn == 0).sum().item()
+            student_valid_ids = student_ids[student_valid_start:]
+            student_decoded = tokenizer.decode(student_valid_ids, skip_special_tokens=False)
+
+            print(f"\n[1] STUDENT INPUT (x + y) - prompt + generated response:")
+            print(f"    Length: {len(student_valid_ids)} tokens")
+            print(f"    Decoded:\n    {repr(student_decoded)}")
+
+            # 2. Decode original input (x + y*): prompt + dataset ground-truth
+            orig_ids = original_input_ids[i]
+            orig_attn = original_attention_mask[i]
+            orig_valid_start = (orig_attn == 0).sum().item()
+            orig_valid_ids = orig_ids[orig_valid_start:]
+            orig_decoded = tokenizer.decode(orig_valid_ids, skip_special_tokens=False)
+
+            print(f"\n[2] ORIGINAL INPUT (x + y*) - prompt + DATASET ground-truth:")
+            print(f"    Length: {len(orig_valid_ids)} tokens")
+            print(f"    Decoded:\n    {repr(orig_decoded)}")
+
+            # 2b. Show y* tokens specifically (dataset ground-truth answer)
+            if original_labels is not None:
+                orig_labels_i = original_labels[i]
+                y_star_mask = orig_labels_i != -100
+                y_star_tokens = orig_ids[y_star_mask]
+                y_star_decoded = tokenizer.decode(y_star_tokens, skip_special_tokens=False)
+                print(f"\n[2b] y* TOKENS (dataset ground-truth answer only):")
+                print(f"    Count: {y_star_mask.sum().item()} tokens")
+                print(f"    Decoded:\n    {repr(y_star_decoded)}")
+
+            # 3. Decode teacher input (x + y* + y): original + generated response
+            teacher_ids = teacher_input_ids[i]
+            teacher_attn = teacher_attention_mask[i]
+            teacher_valid_len = teacher_attn.sum().item()
+            teacher_valid_ids = teacher_ids[:teacher_valid_len]
+            teacher_decoded = tokenizer.decode(teacher_valid_ids, skip_special_tokens=False)
+
+            print(f"\n[3] TEACHER INPUT (x + y* + y) - original + generated response:")
+            print(f"    Length: {teacher_valid_len} tokens")
+            print(f"    Response starts at position: {teacher_response_starts[i]}")
+            print(f"    Decoded:\n    {repr(teacher_decoded)}")
+
+            # 4. Decode loss tokens (labels != -100): only generated response tokens
+            response_mask = response_masks[i]
+            loss_token_ids = student_ids[response_mask]
+            loss_decoded = tokenizer.decode(loss_token_ids, skip_special_tokens=False)
+            num_loss_tokens = response_mask.sum().item()
+
+            print(f"\n[4] LOSS TOKENS (labels != -100) - tokens contributing to KL/JSD loss:")
+            print(f"    Count: {num_loss_tokens} tokens")
+            print(f"    Decoded:\n    {repr(loss_decoded)}")
+
+            # 5. Show the breakdown of teacher input structure
+            teacher_response_start = teacher_response_starts[i]
+            orig_part = teacher_valid_ids[:teacher_response_start]
+            response_part = teacher_valid_ids[teacher_response_start:]
+
+            print(f"\n[5] TEACHER INPUT BREAKDOWN:")
+            print(f"    Original part (x + y*): {teacher_response_start} tokens")
+            print(f"    Decoded: {repr(tokenizer.decode(orig_part, skip_special_tokens=False))}")
+            print(f"    Response part (y): {len(response_part)} tokens")
+            print(f"    Decoded: {repr(tokenizer.decode(response_part, skip_special_tokens=False))}")
+
+            # 6. Verify alignment
+            print(f"\n[6] ALIGNMENT VERIFICATION:")
+            loss_tokens_match = torch.equal(loss_token_ids, response_part) if len(loss_token_ids) == len(response_part) else False
+            print(f"    Loss tokens (y) == Teacher response part: {loss_tokens_match}")
+            if not loss_tokens_match and len(loss_token_ids) > 0 and len(response_part) > 0:
+                print(f"    Loss tokens length: {len(loss_token_ids)}, Response part length: {len(response_part)}")
+                print(f"    Loss tokens (first 10): {loss_token_ids[:10].tolist()}")
+                print(f"    Response part (first 10): {response_part[:10].tolist()}")
+
+            # 6b. Compare y vs y* to verify on-policy generation worked
+            if original_labels is not None:
+                orig_labels_i = original_labels[i]
+                y_star_mask = orig_labels_i != -100
+                y_star_tokens = orig_ids[y_star_mask]
+                y_equals_y_star = torch.equal(loss_token_ids, y_star_tokens) if len(loss_token_ids) == len(y_star_tokens) else False
+                print(f"    y (loss tokens) == y* (dataset answer): {y_equals_y_star}")
+                if y_equals_y_star and on_policy_generated:
+                    print("    [WARNING] y == y* but on_policy_generated=True - generation might have reproduced ground-truth")
+                elif not y_equals_y_star and not on_policy_generated:
+                    print("    [ERROR] y != y* but on_policy_generated=False - this should not happen!")
+
+        print("\n" + "=" * 80 + "\n")
+
     def _compute_self_distillation_loss(self, model, inputs, return_outputs=False):
         """
-        Compute the self-distillation loss where the student and teacher share the same model.
+        Compute the conditional self-distillation loss: min KL( P(y|x) || P(y|x,y*) )
 
-        In this mode:
-        - Student logits: forward pass on (prompt + generated response)
-        - Teacher logits: forward pass on (prompt + ground-truth answer + generated response)
+        Data flow:
+            - original_input_ids: prompt (x) + dataset ground-truth answer (y*)
+              This comes from DataCollatorForChatML and is saved BEFORE generation in training_step.
+            - input_ids: prompt (x) + student-generated response (y)
+              This is produced by generate_on_policy_outputs.
 
-        The distillation loss is computed only on the generated response tokens.
+        Teacher input construction:
+            teacher_input = original_input_ids (x + y*) + response_tokens (y)
+            This ensures the teacher sees: P(y | x, y*) - conditioned on the TRUE dataset answer.
+
+        Student input:
+            student_input = input_ids (x + y)
+            The student sees: P(y | x) - without the ground-truth.
+
+        Loss computation:
+            - Response tokens (y) are identified using labels != -100
+            - Both student and teacher logits are extracted for these response positions
+            - JSD/KL loss is computed only on the response tokens
+
+        IMPORTANT: We do NOT use inputs["prompts"] for slicing because ChatML inserts special tokens.
+        All token identification is based on labels.
         """
-        # Extract the prompt length
-        prompt_lengths = inputs["prompts"].shape[1]
+        batch_size = inputs["input_ids"].shape[0]
+        device = inputs["input_ids"].device
 
-        # Student input: prompt + generated response (this is inputs["input_ids"])
+        # Student input: x + y (prompt + student-generated response)
         student_input_ids = inputs["input_ids"]
         student_attention_mask = inputs["attention_mask"]
+        student_labels = inputs["labels"]
 
-        # Get the generated response part (after prompt)
-        generated_response = student_input_ids[:, prompt_lengths:]
-        generated_response_mask = student_attention_mask[:, prompt_lengths:]
-
-        # Original input contains: prompt + ground-truth answer
+        # Original input from dataset: x + y* (prompt + DATASET ground-truth answer)
+        # This is saved in training_step BEFORE generation, ensuring y* is the true reference
+        # Per-sample alignment: original_input_ids[i] corresponds to student_input_ids[i]
         original_input_ids = inputs["original_input_ids"]
         original_attention_mask = inputs["original_attention_mask"]
 
-        # Teacher input: prompt + ground-truth answer + generated response
-        teacher_input_ids = torch.cat([original_input_ids, generated_response], dim=1)
-        teacher_attention_mask = torch.cat([original_attention_mask, generated_response_mask], dim=1)
+        # Build teacher inputs: (x + y*) + y for each sample
+        # Teacher sees the dataset's ground-truth y*, then the generated response y
+        teacher_input_ids_list = []
+        teacher_attention_mask_list = []
+
+        # Identify response tokens (y) using labels != -100
+        response_masks = student_labels != -100  # [batch_size, seq_len]
+
+        for i in range(batch_size):
+            # Extract generated response tokens (y) from student input using labels mask
+            sample_response_mask = response_masks[i]
+            response_tokens = student_input_ids[i][sample_response_mask]  # y tokens
+
+            # Get original (x + y*) without left-padding
+            orig_attn = original_attention_mask[i]
+            orig_valid_start = (orig_attn == 0).sum().item()  # skip padding
+            orig_valid_ids = original_input_ids[i, orig_valid_start:]  # x + y* (no padding)
+            orig_valid_mask = original_attention_mask[i, orig_valid_start:]
+
+            # Teacher input: (x + y*) + y
+            # This ensures teacher computes P(y | x, y*) conditioned on dataset ground-truth
+            teacher_ids = torch.cat([orig_valid_ids, response_tokens], dim=0)
+            teacher_mask = torch.cat([orig_valid_mask, torch.ones_like(response_tokens)], dim=0)
+
+            teacher_input_ids_list.append(teacher_ids)
+            teacher_attention_mask_list.append(teacher_mask)
+
+        # Pad teacher inputs (right-padding for batch processing)
+        max_teacher_len = max(t.shape[0] for t in teacher_input_ids_list)
+        pad_token_id = self.processing_class.pad_token_id
+
+        teacher_input_ids = torch.full(
+            (batch_size, max_teacher_len), pad_token_id, dtype=torch.long, device=device
+        )
+        teacher_attention_mask = torch.zeros(
+            (batch_size, max_teacher_len), dtype=torch.long, device=device
+        )
+
+        # Track where response tokens start in each teacher sequence
+        teacher_response_starts = []
+        for i in range(batch_size):
+            seq_len = teacher_input_ids_list[i].shape[0]
+            teacher_input_ids[i, :seq_len] = teacher_input_ids_list[i]
+            teacher_attention_mask[i, :seq_len] = teacher_attention_mask_list[i]
+
+            # Response starts after original valid content
+            orig_attn = original_attention_mask[i]
+            orig_valid_len = (orig_attn == 1).sum().item()
+            teacher_response_starts.append(orig_valid_len)
+
+        # Debug: print decoded inputs for alignment verification
+        if self.debug_alignment:
+            self._debug_step_count += 1
+            on_policy_generated = inputs.get("_on_policy_generated", False)
+            original_labels = inputs.get("original_labels", None)
+            self._print_alignment_debug(
+                student_input_ids=student_input_ids,
+                student_attention_mask=student_attention_mask,
+                teacher_input_ids=teacher_input_ids,
+                teacher_attention_mask=teacher_attention_mask,
+                teacher_response_starts=teacher_response_starts,
+                original_input_ids=original_input_ids,
+                original_attention_mask=original_attention_mask,
+                original_labels=original_labels,
+                response_masks=response_masks,
+                batch_size=batch_size,
+                on_policy_generated=on_policy_generated,
+            )
 
         # Compute student output
         student_outputs = model(
@@ -435,33 +642,69 @@ class GKDTrainer(SFTTrainer):
         )
 
         # Compute teacher output (same model, but with different input)
-        # Use no_grad since we only need the teacher logits for computing the target distribution
         with torch.no_grad():
             teacher_outputs = model(
                 input_ids=teacher_input_ids,
                 attention_mask=teacher_attention_mask,
             )
 
-        # Extract logits for the generated response tokens
-        # Student: logits for generated response start at position (prompt_lengths - 1) and go to (-1)
-        # because we predict the next token
-        shifted_student_logits = student_outputs.logits[:, prompt_lengths - 1 : -1, :]
+        # Compute loss per-sample and aggregate
+        # For next-token prediction: logit[t] predicts token[t+1]
+        # Use shifted approach: shifted_logits = logits[:-1], shifted_labels = labels[1:]
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        total_tokens = 0
 
-        # Teacher: the generated response starts at position original_input_ids.shape[1]
-        # So the logits for predicting generated response tokens start at position (original_input_ids.shape[1] - 1)
-        teacher_response_start = original_input_ids.shape[1] - 1
-        shifted_teacher_logits = teacher_outputs.logits[:, teacher_response_start : -1, :]
+        for i in range(batch_size):
+            num_response_tokens = response_masks[i].sum().item()
+            if num_response_tokens == 0:
+                continue
 
-        # Labels for the generated response tokens
-        shifted_labels = inputs["labels"][:, prompt_lengths:]
+            # Student: shift logits and labels for next-token prediction
+            student_logits_i = student_outputs.logits[i]  # [student_seq_len, vocab_size]
+            shifted_student_logits = student_logits_i[:-1]  # [seq_len-1, vocab]
+            shifted_student_labels = student_labels[i, 1:]  # [seq_len-1]
 
-        # Compute the generalized JSD loss
-        loss = self.generalized_jsd_loss(
-            student_logits=shifted_student_logits,
-            teacher_logits=shifted_teacher_logits,
-            labels=shifted_labels,
-            beta=self.beta,
-        )
+            # Extract student logits for response tokens (where shifted_labels != -100)
+            response_mask_shifted = shifted_student_labels != -100
+            shifted_student_logits_response = shifted_student_logits[response_mask_shifted]
+
+            # Teacher: extract logits that predict the response tokens
+            # Response tokens in teacher seq start at teacher_response_start
+            # To predict tokens at positions [start, start+1, ..., start+n-1],
+            # we need logits at positions [start-1, start, ..., start+n-2]
+            teacher_logits_i = teacher_outputs.logits[i]
+            teacher_response_start = teacher_response_starts[i]
+            teacher_logit_start = max(0, teacher_response_start - 1)
+            teacher_logit_end = teacher_response_start + num_response_tokens - 1
+            shifted_teacher_logits_response = teacher_logits_i[teacher_logit_start:teacher_logit_end]
+
+            # Handle potential shape mismatch due to edge cases
+            if shifted_student_logits_response.shape[0] != shifted_teacher_logits_response.shape[0]:
+                min_len = min(shifted_student_logits_response.shape[0], shifted_teacher_logits_response.shape[0])
+                shifted_student_logits_response = shifted_student_logits_response[:min_len]
+                shifted_teacher_logits_response = shifted_teacher_logits_response[:min_len]
+
+            if shifted_student_logits_response.shape[0] == 0:
+                continue
+
+            # Compute JSD loss for this sample
+            sample_loss = self.generalized_jsd_loss(
+                student_logits=shifted_student_logits_response.unsqueeze(0),
+                teacher_logits=shifted_teacher_logits_response.unsqueeze(0),
+                labels=None,  # Already filtered to response tokens only
+                beta=self.beta,
+                temperature=self.temperature,
+                reduction="sum",
+            )
+
+            total_loss = total_loss + sample_loss
+            total_tokens += shifted_student_logits_response.shape[0]
+
+        # Average over all response tokens (batchmean)
+        if total_tokens > 0:
+            loss = total_loss / total_tokens
+        else:
+            loss = total_loss
 
         # Empty cache
         empty_cache()
@@ -470,23 +713,45 @@ class GKDTrainer(SFTTrainer):
 
     @staticmethod
     def generate_on_policy_outputs(model, inputs, generation_config, pad_token_id=None):
+        """
+        Generate on-policy outputs from the model.
+
+        Returns:
+            generated_tokens: [batch_size, seq_len] - prompt + generated response
+            new_attention_mask: [batch_size, seq_len] - attention mask
+            new_labels: [batch_size, seq_len] - labels with -100 for prompt and padding tokens
+        """
+        # Get prompt information (accounting for left-padding)
+        prompts = inputs["prompts"]
+        prompt_attention_mask = inputs.get("prompt_attention_mask", None)
+
         # Generate output with respect to the prompt-only
         generated_outputs = model.generate(
-            input_ids=inputs["prompts"],
-            attention_mask=inputs.get("prompt_attention_mask", None),
+            input_ids=prompts,
+            attention_mask=prompt_attention_mask,
             generation_config=generation_config,
             return_dict_in_generate=True,
         )
 
-        # Get the generated token IDs
-        generated_tokens = generated_outputs.sequences
+        # Get the generated token IDs (includes prompt + generated)
+        generated_tokens = generated_outputs.sequences  # [batch_size, total_seq_len]
+
         # Calculate new attention mask
         new_attention_mask = torch.ones_like(generated_tokens)
         new_labels = generated_tokens.clone()
 
-        # If there's pad_token_id, set attention mask to 0 for padding tokens
+        # Mask prompt tokens with -100 in labels
+        # model.generate preserves the input structure, so prompt occupies first prompt_seq_len positions
+        prompt_seq_len = prompts.shape[1]
+        new_labels[:, :prompt_seq_len] = -100
+
+        # Set pad tokens to -100 in labels and 0 in attention mask
         if pad_token_id is not None:
-            new_labels[new_labels == pad_token_id] = -100
+            # Only mask padding AFTER the prompt portion (generated padding)
+            pad_mask = generated_tokens == pad_token_id
+            # Don't modify prompt region labels again (already -100)
+            pad_mask[:, :prompt_seq_len] = False
+            new_labels[pad_mask] = -100
             new_attention_mask[generated_tokens == pad_token_id] = 0
 
         return generated_tokens, new_attention_mask, new_labels
@@ -501,15 +766,28 @@ class GKDTrainer(SFTTrainer):
         `self.lmbda`, it generates new responses using the student model, which are then used for training instead of
         the original inputs.
 
-        In self-distillation mode, the ground-truth answer is preserved and concatenated with the generated response
-        to form the teacher input.
-        """
-        # For self-distillation, save the original input (prompt + ground-truth answer) before on-policy generation
-        if self.self_distillation:
-            original_input_ids = inputs["input_ids"].clone()
-            original_attention_mask = inputs["attention_mask"].clone()
+        For conditional self-distillation, the teacher input is (x, y*, y) where:
+            - x  = prompt from the dataset
+            - y* = ground-truth answer from the dataset (NOT model prediction)
+            - y  = student-generated response
 
+        This implements: min KL( P(y|x) || P(y|x, y*) )
+        """
+        # For self-distillation: save the DATASET's (prompt + ground-truth answer) BEFORE generation
+        # This is CRITICAL: original_input_ids contains y* from the dataset, not any model prediction
+        # inputs["input_ids"] at this point = DataCollatorForChatML output = prompt + dataset_ground_truth
+        if self.self_distillation:
+            original_input_ids = inputs["input_ids"].clone()  # prompt + y* (from dataset)
+            original_attention_mask = inputs["attention_mask"].clone()
+            original_labels = inputs["labels"].clone()  # -100 for prompt, actual tokens for y*
+
+        # seq_kd: generate from teacher model (NOT compatible with self_distillation where teacher_model=None)
         if self.seq_kd:
+            if self.teacher_model is None:
+                raise ValueError(
+                    "seq_kd=True requires a teacher model, but teacher_model is None. "
+                    "seq_kd is not compatible with self_distillation mode."
+                )
             with unwrap_model_for_generation(self.teacher_model, self.accelerator) as unwrapped_model:
                 new_input_ids, new_attention_mask, new_labels = self.generate_on_policy_outputs(
                     unwrapped_model, inputs, self.generation_config, self.processing_class.pad_token_id
@@ -517,6 +795,10 @@ class GKDTrainer(SFTTrainer):
             inputs["input_ids"] = new_input_ids
             inputs["attention_mask"] = new_attention_mask
             inputs["labels"] = new_labels
+            inputs["_on_policy_generated"] = True  # Flag for debug
+
+        # On-policy generation with probability lmbda
+        on_policy_generated = False
         if random.random() <= self.lmbda:
             with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
                 new_input_ids, new_attention_mask, new_labels = self.generate_on_policy_outputs(
@@ -525,11 +807,15 @@ class GKDTrainer(SFTTrainer):
             inputs["input_ids"] = new_input_ids
             inputs["attention_mask"] = new_attention_mask
             inputs["labels"] = new_labels
+            on_policy_generated = True
 
-        # For self-distillation, pass the original input containing the ground-truth answer
+        # For self-distillation: pass the original dataset input (prompt + ground-truth y*)
+        # Per-sample alignment is preserved because generate() maintains batch order
         if self.self_distillation:
-            inputs["original_input_ids"] = original_input_ids
+            inputs["original_input_ids"] = original_input_ids  # prompt + y* (dataset ground-truth)
             inputs["original_attention_mask"] = original_attention_mask
+            inputs["original_labels"] = original_labels
+            inputs["_on_policy_generated"] = on_policy_generated  # For debug printer
 
         loss = super().training_step(model, inputs, num_items_in_batch)
         return loss

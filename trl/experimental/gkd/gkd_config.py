@@ -110,6 +110,13 @@ class GKDConfig(SFTConfig):
             "while the student logits come from the forward pass on the generated response only."
         },
     )
+    debug_alignment: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to print debug information about token alignment during self-distillation training. "
+            "Prints decoded student input, teacher input, and loss tokens to verify correct alignment."
+        },
+    )
 
     def __post_init__(self):
         super().__post_init__()
